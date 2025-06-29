@@ -1,0 +1,35 @@
+[project]
+name = "PortfolioBackend"
+version = "1.0.0"
+description = "A FastAPI service that streams responses from OpenAI LLM"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "fastapi==0.104.1",
+    "uvicorn[standard]==0.24.0",
+    "openai>=1.12.0",
+    "python-multipart==0.0.6",
+    "pydantic==2.5.0",
+    "httpx>=0.25.0",
+    "redis>=5.0.0",
+    "slowapi>=0.1.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "requests",
+    "pytest",
+    "black",
+    "flake8",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "requests",
+    "pytest",
+    "black",
+    "flake8",
+] 
