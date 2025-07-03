@@ -6,7 +6,8 @@ import openai
 import os
 import json
 import time
-from typing import AsyncGenerator
+import uuid
+from typing import AsyncGenerator, List, Optional
 import dotenv
 import redis
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -16,11 +17,21 @@ from slowapi.errors import RateLimitExceeded
 # Load environment variables from .env if present
 dotenv.load_dotenv()
 
+# Debug Redis connection settings
+redis_host = os.getenv("REDIS_HOST", "localhost")
+redis_port = int(os.getenv("REDIS_PORT", 6379))
+redis_db = int(os.getenv("REDIS_DB", 0))
+
+print(f"🔍 Redis connection settings:")
+print(f"   Host: {redis_host}")
+print(f"   Port: {redis_port}")
+print(f"   DB: {redis_db}")
+
 # Initialize Redis client
 redis_client = redis.Redis(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", 6379)),
-    db=int(os.getenv("REDIS_DB", 0)),
+    host=redis_host,
+    port=redis_port,
+    db=redis_db,
     decode_responses=True,
     socket_connect_timeout=5,
     socket_timeout=5,
@@ -53,170 +64,161 @@ app.add_middleware(
 # Request model
 class PromptRequest(BaseModel):
     prompt: str
+    session_id: Optional[str] = None
 
 # Initialize OpenAI client
 client = openai.OpenAI()
 
-async def stream_openai_response(prompt: str) -> AsyncGenerator[str, None]:
+def load_system_prompt() -> str:
     """
-    Stream response from OpenAI LLM
+    Load system prompt from external files
     """
     try:
+        # Load the system prompt instructions
+        system_prompt_path = "./data/system_prompt.md"
+        
+        system_prompt = ""
+        
+        # Read system prompt if it exists
+        if os.path.exists(system_prompt_path):
+            with open(system_prompt_path, 'r', encoding='utf-8') as f:
+                system_prompt = f.read().strip()
+        
+        if system_prompt:
+            return f"{system_prompt}"
+        else:
+            raise FileNotFoundError("system_prompt.md not found")
+            
+    except Exception as e:
+        print(f"Error loading system prompt: {e}")
+        # Fallback to a minimal prompt
+        return "You are an AI assistant. Please respond to user queries."
+
+# Load system prompt once at startup
+SYSTEM_PROMPT = load_system_prompt()
+
+# Session management functions
+def create_session() -> str:
+    """
+    Create a new session and return session ID
+    """
+    session_id = str(uuid.uuid4())
+    session_data = {
+        "session_id": session_id,
+        "created_at": int(time.time() * 1000),
+        "last_activity": int(time.time() * 1000),
+        "messages": []
+    }
+    
+    # Store session in Redis with 24-hour TTL
+    redis_client.setex(
+        f"chat:session:{session_id}",
+        86400,  # 24 hours in seconds
+        json.dumps(session_data)
+    )
+    
+    return session_id
+
+def get_session(session_id: str) -> Optional[dict]:
+    """
+    Retrieve session data from Redis
+    """
+    try:
+        session_data = redis_client.get(f"chat:session:{session_id}")
+        # print("session_data", session_data)
+        if session_data:
+            return json.loads(session_data)
+        return None
+    except Exception as e:
+        print(f"Error retrieving session {session_id}: {e}")
+        return None
+
+def save_message(session_id: str, role: str, content: str):
+    """
+    Save a message to the session
+    """
+    try:
+        session_data = get_session(session_id)
+        if not session_data:
+            return
+        
+        # Add new message
+        message = {
+            "role": role,
+            "content": content,
+            "timestamp": int(time.time() * 1000)
+        }
+        
+        session_data["messages"].append(message)
+        session_data["last_activity"] = int(time.time() * 1000)
+        
+        # Keep only last 20 messages
+        if len(session_data["messages"]) > 20:
+            session_data["messages"] = session_data["messages"][-20:]
+        
+        # Update session in Redis (refresh TTL)
+        redis_client.setex(
+            f"chat:session:{session_id}",
+            86400,  # 24 hours in seconds
+            json.dumps(session_data)
+        )
+        
+    except Exception as e:
+        print(f"Error saving message to session {session_id}: {e}")
+
+def get_chat_history(session_id: str) -> List[dict]:
+    """
+    Get chat history for a session (last 20 messages)
+    """
+    session_data = get_session(session_id)
+    if session_data:
+        return session_data.get("messages", [])
+    return []
+
+async def stream_openai_response(prompt: str, session_id: Optional[str] = None) -> AsyncGenerator[str, None]:
+    """
+    Stream response from OpenAI LLM with session support
+    """
+    try:
+        # Prepare messages for OpenAI
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        
+        # Add chat history if session exists
+        if session_id:
+            chat_history = get_chat_history(session_id)
+            messages.extend(chat_history)
+        
+        # Add current user message
+        messages.append({"role": "user", "content": prompt})
+        
+        # Save user message to session
+        if session_id:
+            save_message(session_id, "user", prompt)
+        
         # Create streaming chat completion
         stream = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": 
-"""
-You are sitting on the Portfolio website of Kritagya Khandelwal, Your purpose is to mirror him and respond to queries on behalf of him.
-below is the Profile details of him.
-
-# Kritagya Khandelwal  
-*Senior Software Engineer at [Yubi](https://go-yubi.com)*  
-
-
----
-
-### Philosophy  
-> A firm believer in "Evolution is randomness seeking betterment" and therefore often found thinking about unprecedented possibilities.
-
----
-
-### Summary  
-I have 4+ years of experience building scalable systems and solving complex problems. I completed my Bachelor's degree in Computer Science and Engineering from IIIT Una, which instilled a strong curiosity within me to explore diverse technologies.
-
----
-
-## Experience  
-
-### Senior Software Engineer — [Yubi](https://go-yubi.com)  
-*July 2022 - Present*  
-- Mentor and build microservices from the ground up using Java, Springboot, Elasticsearch, MongoDB, Temporal, and Kafka.  
-- Implemented CQRS flow and adopted GraphQL as the API architecture.  
-- Optimized Homepage load time by 5x by introducing GraphQL and reactive/async programming in backend reducing network calls and latency.  
-- Continuously introduce backend optimizations including query, index, and infrastructure level improvements.
-
-### Software Engineer — [314e](https://www.314e.com)  
-*June 2021 - July 2022*  
-- Developed backend APIs using FastAPI (Python) and PostgreSQL; handled message queuing with RabbitMQ.  
-- Automated accessibility validation on auto-generated webpages using DOM & CSSOM parsing with Python.  
-- Worked extensively on Authentication and Authorization using OAuth 2.0 and RBAC strategies.
-
-### Software Development Intern — [GrowthGear](https://growthgear.in)  
-*Dec 2020 - May 2021*  
-- Developed frontend with ReactJS and implemented real-time communication using socket.io.  
-- Created server-side APIs with Node.js, ExpressJS, MongoDB, and REST architecture.  
-- Improved backend performance by integrating Redis caching, reducing network calls and DB interactions.  
-- [Internship Project Details](https://kritagya-khandelwal.github.io/Portfolio/projects/internship_4yr.html)  
-
-### Summer Intern — [Destiny Design](http://www.destinydesign.com)  
-*June 2020 - Aug 2020*  
-- Full-stack development of a Facebook Instant Game from scratch.  
-- Deployed backend webhook on AWS EC2 using Apache server, openSSL, and Node.js.  
-- Integrated Facebook Instant Games and Messenger APIs with front-end built on JavaScript, JQuery, and DOM.  
-- [Internship Project Details](https://kritagya-khandelwal.github.io/Portfolio/projects/internship_3yr.html)  
-
-### Software Intern — [Airtel](https://www.airtel.in)  
-*June 2019 - July 2019*  
-- Managed RHEL physical servers and automated OS installation using Anaconda file.  
-- Synchronized mount points for critical data backups between servers.  
-- Installed and configured Apache server on RHEL 7 to host webpages.  
-- [Internship Project Details](https://kritagya-khandelwal.github.io/Portfolio/projects/internship_2yr.html)  
-
----
-
-## Skills
-
-| Category             | Technologies & Tools                                                |
-|----------------------|-------------------------------------------------------------------|
-| **Programming Languages** | Java, Python, JavaScript, C++                                   |
-| **Frameworks**           | Springboot, FastAPI, ExpressJS, React, FastMCP, Temporal         |
-| **Artificial Intelligence** | FastMCP, LangGraph                                             |
-| **Databases / Messaging**  | MongoDB, PostgreSQL, Elasticsearch, Redis, Kafka, RabbitMQ       |
-| **Protocols / APIs**       | HTTP, GraphQL, REST, gRPC, MCP, OpenAPI, OpenTelemetry            |
-| **Tools / Platform**       | Docker, Git, AWS, Jenkins                                         |
-
----
-
-## Education
-
-**B.Tech in Computer Science and Engineering**  
-IIIT Una | 2017 - 2021  
-Graduated with 8.4 CGPA with strong foundation and rich tech exploration.
-
-**Grade 12 (Science Stream)**  
-RPVV, Kishan Ganj, Delhi | 2017
-
-**Grade 10**  
-RPVV, Kishan Ganj, Delhi | 2015
-
----
-
-## Projects
-
-### [Artificial Evolution of Artificial Ant](https://kritagya-khandelwal.github.io/Portfolio/projects/pae_ant.html)  
-- Simulated an artificial environment where an ant navigates to find and eat food.  
-- Technologies: AI, Neural Networks, Genetic Algorithm, Python, Blender.
-
-### [Multi-Player Uno Game: Muno](https://kritagya-khandelwal.github.io/Portfolio/projects/pmuno_python.html)  
-- Multi-player Uno game supporting simultaneous players under server-client architecture using TCP protocol.  
-- Developed with Python’s pygame module and implemented multi-threading.
-
-### [3-D Map of my Hostel: Digital Himgiri](https://kritagya-khandelwal.github.io/Portfolio/projects/punreal_project.html)  
-- Digital simulation of a hostel environment.  
-- Used Unreal Engine 4 for level development and Blender for 3D model creation.  
-- Applied real object images for realistic materials.
-
-### [Flight Booking Android App](https://kritagya-khandelwal.github.io/Portfolio/projects/prcs_android.html)  
-- Project done for Ministry of Civil Aviation during Smart India Hackathon 2019.  
-- Designed to provide transparency on subsidy distribution ensuring eligibility.  
-- Built with Java, Android Studio, XML, and designed assets with GIMP.
-
----
-
-## Achievements
-
-- **AIR 58** - Amazon HackOn 2022  
-- **Rank 391 Globally** - Google Kickstart Round C 2022  
-- **Onsite Grand Finalist** - Smart India Hackathon 2019  
-- **Rank 219 India** - ACM ICPC 2018-19 (Team: Vultures)  
-- **State Level Winner** - Mental Maths Quiz 2013  
-
----
-
-## Contact
-
-- 📧 Email: [kritagya.0398@gmail.com](mailto:kritagya.0398@gmail.com)  
-- 🔗 LinkedIn: [linkedin.com/in/kritagya-khandelwal](https://www.linkedin.com/in/kritagya-khandelwal/)  
-- 💻 GitHub: [github.com/kritagya-khandelwal](https://github.com/kritagya-khandelwal)  
-- ✍️ Medium: [medium.com/@kritagya.0398](https://medium.com/@kritagya.0398)  
-- 📞 Phone: +91 8178638856  
-
----
-
-*End of Profile*
-
-
-When asked any query by the user, you must reply concisely and use the details provided to you.
-If asked something you don't know simply say 'I don't know about this.'
-Your output should be concise with a tint of humor, you can use emojis in a subtle way.
-
-"""
-                 },
-                {"role": "user", "content": prompt}
-            ],
+            messages=messages,
             stream=True,
             temperature=0.7,
             max_tokens=1000
         )
         
+        # Collect full response for saving
+        full_response = ""
+        
         # Stream the response
         for chunk in stream:
             if chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
+                full_response += content
                 timestamp = int(time.time() * 1000)  # Epoch milliseconds
                 json_data = json.dumps({'content': content, 'type': 'chunk', 'timestamp': timestamp}, ensure_ascii=False)
                 yield f"data: {json_data}\n\n"
+        
+        # Save assistant response to session
+        if session_id and full_response:
+            save_message(session_id, "assistant", full_response)
         
         # Send end signal
         end_data = json.dumps({'content': '', 'type': 'end', 'timestamp': int(time.time() * 1000)}, ensure_ascii=False)
@@ -235,7 +237,7 @@ async def root():
     return {"message": "PortfolioBackend", "status": "running"}
 
 @app.post("/stream")
-@limiter.limit("10/minute")  # Allow 10 requests per minute per IP
+@limiter.limit("10/hour")  # Allow 10 requests per hour per IP
 async def stream_llm_response(request: Request, prompt_request: PromptRequest):
     """
     Stream LLM response endpoint with rate limiting
@@ -251,7 +253,7 @@ async def stream_llm_response(request: Request, prompt_request: PromptRequest):
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
     
     return StreamingResponse(
-        stream_openai_response(prompt_request.prompt),
+        stream_openai_response(prompt_request.prompt, prompt_request.session_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -294,14 +296,105 @@ async def rate_limit_info(request: Request):
         return {
             "ip": get_remote_address(request),
             "current_requests": int(current_requests) if current_requests else 0,
-            "limit": "10/day",
-            "reset_time": "Next day"
+            "limit": "10/hour",
+            "reset_time": "Next hour"
         }
     except Exception as e:
         return {
             "ip": get_remote_address(request),
             "error": f"Could not retrieve rate limit info: {str(e)}"
         }
+
+@app.post("/session")
+async def create_new_session():
+    """
+    Create a new chat session
+    """
+    try:
+        session_id = create_session()
+        return {
+            "session_id": session_id,
+            "message": "Session created successfully",
+            "ttl": "24 hours"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create session: {str(e)}")
+
+@app.get("/session/{session_id}")
+async def get_session_history(session_id: str):
+    """
+    Get chat history for a session
+    """
+    try:
+        session_data = get_session(session_id)
+        if not session_data:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        return {
+            "session_id": session_id,
+            "created_at": session_data["created_at"],
+            "last_activity": session_data["last_activity"],
+            "message_count": len(session_data["messages"]),
+            "messages": session_data["messages"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve session: {str(e)}")
+
+@app.delete("/session/{session_id}")
+async def delete_session(session_id: str):
+    """
+    Delete a chat session
+    """
+    try:
+        # Check if session exists
+        session_data = get_session(session_id)
+        if not session_data:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Delete session from Redis
+        redis_client.delete(f"chat:session:{session_id}")
+        
+        return {
+            "session_id": session_id,
+            "message": "Session deleted successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete session: {str(e)}")
+
+@app.get("/sessions")
+async def list_sessions(request: Request):
+    """
+    List all active sessions for the current IP (for debugging/admin purposes)
+    """
+    try:
+        # Get all session keys for this IP (using IP as prefix for organization)
+        ip = get_remote_address(request)
+        pattern = f"chat:session:*"
+        session_keys = redis_client.keys(pattern)
+        
+        sessions = []
+        for key in session_keys:
+            session_data = redis_client.get(key)
+            if session_data:
+                session_info = json.loads(session_data)
+                sessions.append({
+                    "session_id": session_info["session_id"],
+                    "created_at": session_info["created_at"],
+                    "last_activity": session_info["last_activity"],
+                    "message_count": len(session_info["messages"])
+                })
+        
+        return {
+            "ip": ip,
+            "total_sessions": len(sessions),
+            "sessions": sessions
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list sessions: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
