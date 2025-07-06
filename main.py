@@ -7,7 +7,9 @@ import os
 import json
 import time
 import uuid
-from typing import AsyncGenerator, List, Optional
+import requests
+import datetime
+from typing import AsyncGenerator, List, Optional, Dict, Any
 import dotenv
 import redis
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -21,6 +23,9 @@ dotenv.load_dotenv()
 redis_host = os.getenv("REDIS_HOST", "localhost")
 redis_port = int(os.getenv("REDIS_PORT", 6379))
 redis_db = int(os.getenv("REDIS_DB", 0))
+pushover_user = os.getenv("PUSHOVER_USER")
+pushover_token = os.getenv("PUSHOVER_TOKEN")
+pushover_url = "https://api.pushover.net/1/messages.json"
 
 print(f"🔍 Redis connection settings:")
 print(f"   Host: {redis_host}")
@@ -69,13 +74,288 @@ class PromptRequest(BaseModel):
 # Initialize OpenAI client
 client = openai.OpenAI()
 
+# Tools definitions
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current date and time",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "Timezone (e.g., 'UTC', 'America/New_York')",
+                        "default": "UTC"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather information for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City name or coordinates (e.g., 'New York', 'London', '40.7128,-74.0060')"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Perform mathematical calculations",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Mathematical expression to evaluate (e.g., '2 + 2', 'sqrt(16)', 'sin(45)')"
+                    }
+                },
+                "required": ["expression"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_session_info",
+            "description": "Get information about the current chat session",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID to get info for"
+                    }
+                },
+                "required": ["session_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_reminder",
+            "description": "Create a reminder for a specific time",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Reminder title"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Reminder description"
+                    },
+                    "datetime": {
+                        "type": "string",
+                        "description": "Reminder datetime (ISO format: YYYY-MM-DDTHH:MM:SS)"
+                    }
+                },
+                "required": ["title", "datetime"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_user_details",
+            "description": "Use this tool to record that a user is interested in being in touch and provided an email address",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "The email address of this user"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "The user's name, if they provided it"
+                    }
+                    ,
+                    "notes": {
+                        "type": "string",
+                        "description": "Any additional information about the conversation that's worth recording to give context"
+                    }
+                },
+                "required": ["email"],
+                "additionalProperties": False
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_unknown_question",
+            "description": "Use this tool to record that a user asked a question that I couldn't answer",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question that couldn't be answered"
+                    }
+                },
+                "required": ["question"]
+            }
+        }
+    }
+]
+
+# Tool functions
+
+def push(message):
+    """Push a message to Kritagya Khandelwal"""
+    try:
+        print(f"Push: {message}")
+        payload = {"user": pushover_user, "token": pushover_token, "message": message}
+        requests.post(pushover_url, data=payload)
+    except Exception as e:
+        print(f"Error pushing to Pushover: {e}")
+
+def record_user_details(email, name="Name not provided", notes="not provided"):
+    """Record user details"""
+    push(f"Recording interest from {name} with email {email} and notes {notes}")
+    return "Interest recorded"
+
+def record_unknown_question(question):
+    """Record unknown question"""
+    push(f"Recording {question} asked that I couldn't answer")
+    return "Question recorded"
+
+def get_current_time(timezone: str = "UTC") -> str:
+    """Get current date and time"""
+    try:
+        now = datetime.datetime.now()
+        return f"Current time ({timezone}): {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    except Exception as e:
+        return f"Error getting time: {str(e)}"
+
+def get_weather(location: str) -> str:
+    """Get weather information for a location"""
+    try:
+        # Using a free weather API (you might want to use a different one)
+        # This is a mock implementation - replace with actual API
+        return f"Weather for {location}: 72°F, Partly Cloudy (Mock data - replace with actual weather API)"
+    except Exception as e:
+        return f"Error getting weather: {str(e)}"
+
+def calculate(expression: str) -> str:
+    """Perform mathematical calculations"""
+    try:
+        # Safe evaluation of mathematical expressions
+        allowed_names = {
+            'abs': abs, 'round': round, 'min': min, 'max': max,
+            'sum': sum, 'len': len, 'pow': pow
+        }
+        
+        # Remove any potentially dangerous characters
+        expression = ''.join(c for c in expression if c.isalnum() or c in '+-*/.() ')
+        
+        # Evaluate the expression
+        result = eval(expression, {"__builtins__": {}}, allowed_names)
+        return f"Result: {expression} = {result}"
+    except Exception as e:
+        return f"Error calculating {expression}: {str(e)}"
+
+def web_search(query: str) -> str:
+    """Search the web for information"""
+    try:
+        # This is a mock implementation - replace with actual search API
+        return f"Search results for '{query}': (Mock data - replace with actual search API like Google Custom Search or DuckDuckGo)"
+    except Exception as e:
+        return f"Error searching: {str(e)}"
+
+def get_session_info(session_id: str) -> str:
+    """Get information about a chat session"""
+    try:
+        session_data = get_session(session_id)
+        if session_data:
+            message_count = len(session_data.get("messages", []))
+            created_at = datetime.datetime.fromtimestamp(session_data["created_at"] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            last_activity = datetime.datetime.fromtimestamp(session_data["last_activity"] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            
+            return f"Session Info:\n- Message count: {message_count}\n- Created: {created_at}\n- Last activity: {last_activity}"
+        else:
+            return f"Session {session_id} not found"
+    except Exception as e:
+        return f"Error getting session info: {str(e)}"
+
+def create_reminder(title: str, datetime_str: str, description: str = "") -> str:
+    """Create a reminder"""
+    try:
+        # Parse datetime
+        reminder_time = datetime.datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+        now = datetime.datetime.now(reminder_time.tzinfo)
+        
+        if reminder_time > now:
+            time_diff = reminder_time - now
+            return f"Reminder created: '{title}' for {datetime_str}\nTime until reminder: {time_diff}"
+        else:
+            return f"Reminder created: '{title}' for {datetime_str}\nNote: This time has already passed"
+    except Exception as e:
+        return f"Error creating reminder: {str(e)}"
+
+# Tool execution function
+def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """Execute a tool function"""
+    tool_functions = {
+        "get_current_time": get_current_time,
+        "get_weather": get_weather,
+        "calculate": calculate,
+        "web_search": web_search,
+        "get_session_info": get_session_info,
+        "create_reminder": create_reminder,
+        "record_user_details": record_user_details,
+        "record_unknown_question": record_unknown_question
+    }
+    
+    if tool_name in tool_functions:
+        try:
+            return tool_functions[tool_name](**arguments)
+        except Exception as e:
+            return f"Error executing {tool_name}: {str(e)}"
+    else:
+        return f"Unknown tool: {tool_name}"
+
 def load_system_prompt() -> str:
     """
     Load system prompt from external files
     """
     try:
         # Load the system prompt instructions
-        system_prompt_path = "./data/system_prompt.md"
+        system_prompt_path = "data/system_prompt.md"
         
         system_prompt = ""
         
@@ -177,7 +457,7 @@ def get_chat_history(session_id: str) -> List[dict]:
 
 async def stream_openai_response(prompt: str, session_id: Optional[str] = None) -> AsyncGenerator[str, None]:
     """
-    Stream response from OpenAI LLM with session support
+    Stream response from OpenAI LLM with session support and function calling
     """
     try:
         # Prepare messages for OpenAI
@@ -195,30 +475,103 @@ async def stream_openai_response(prompt: str, session_id: Optional[str] = None) 
         if session_id:
             save_message(session_id, "user", prompt)
         
-        # Create streaming chat completion
-        stream = client.chat.completions.create(
+        # First, try to get a response with potential tool calls
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            stream=True,
+            tools=TOOLS,
+            tool_choice="auto",
             temperature=0.7,
             max_tokens=1000
         )
         
-        # Collect full response for saving
-        full_response = ""
+        assistant_message = response.choices[0].message
+        messages.append(assistant_message)
         
-        # Stream the response
-        for chunk in stream:
-            if chunk.choices[0].delta.content is not None:
-                content = chunk.choices[0].delta.content
-                full_response += content
-                timestamp = int(time.time() * 1000)  # Epoch milliseconds
-                json_data = json.dumps({'content': content, 'type': 'chunk', 'timestamp': timestamp}, ensure_ascii=False)
+        # Check if there are tool calls
+        if assistant_message.tool_calls:
+            print(f"🔧 Tool calls detected: {len(assistant_message.tool_calls)}")
+            # Execute tool calls
+            tool_results = []
+            for tool_call in assistant_message.tool_calls:
+                try:
+                    function_name = tool_call.function.name
+                    arguments = json.loads(tool_call.function.arguments)
+                    
+                    print(f"🔧 Executing tool: {function_name} with args: {arguments}")
+                    
+                    # Execute the tool
+                    result = execute_tool(function_name, arguments)
+                    
+                    print(f"🔧 Tool result: {result}")
+                    
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "content": result
+                    })
+                    
+                    # Send tool result as a special chunk
+                    timestamp = int(time.time() * 1000)
+                    tool_data = json.dumps({
+                        'content': f"[Tool Result: {function_name}] {result}",
+                        'type': 'tool_result',
+                        'tool_name': function_name,
+                        'result': result,
+                        'timestamp': timestamp
+                    }, ensure_ascii=False)
+                    yield f"data: {tool_data}\n\n"
+                    
+                except Exception as e:
+                    print(f"❌ Error executing tool {function_name}: {e}")
+                    error_result = f"Error executing tool {function_name}: {str(e)}"
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "content": error_result
+                    })
+            
+            # Add tool results to messages
+            messages.extend(tool_results)
+            
+            # Get final response from OpenAI (streaming)
+            final_response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            # Stream the final response
+            for chunk in final_response:
+                if chunk.choices[0].delta.content is not None:
+                    content = chunk.choices[0].delta.content
+                    timestamp = int(time.time() * 1000)
+                    json_data = json.dumps({'content': content, 'type': 'chunk', 'timestamp': timestamp}, ensure_ascii=False)
+                    yield f"data: {json_data}\n\n"
+            
+            # Save the complete response
+            if session_id:
+                complete_response = assistant_message.content or ""
+                if tool_results:
+                    complete_response += "\n\n[Tool Results:]\n"
+                    for result in tool_results:
+                        complete_response += f"- {result['content']}\n"
+                # Add the final response content
+                complete_response += response.choices[0].message.content or ""
+                save_message(session_id, "assistant", complete_response)
+        else:
+            print("📝 No tool calls detected")
+            # No tool calls, stream the response directly
+            for char in assistant_message.content or "":
+                timestamp = int(time.time() * 1000)
+                json_data = json.dumps({'content': char, 'type': 'chunk', 'timestamp': timestamp}, ensure_ascii=False)
                 yield f"data: {json_data}\n\n"
-        
-        # Save assistant response to session
-        if session_id and full_response:
-            save_message(session_id, "assistant", full_response)
+            
+            # Save the response
+            if session_id and assistant_message.content:
+                save_message(session_id, "assistant", assistant_message.content)
         
         # Send end signal
         end_data = json.dumps({'content': '', 'type': 'end', 'timestamp': int(time.time() * 1000)}, ensure_ascii=False)
@@ -249,6 +602,9 @@ async def stream_llm_response(request: Request, prompt_request: PromptRequest):
     Returns:
         StreamingResponse with the LLM response
     """
+
+    print("prompt_request", prompt_request)
+
     if not prompt_request.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
     
@@ -395,6 +751,51 @@ async def list_sessions(request: Request):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list sessions: {str(e)}")
+
+@app.get("/tools")
+async def list_tools():
+    """
+    List all available tools/functions
+    """
+    try:
+        tools_info = []
+        for tool in TOOLS:
+            if tool["type"] == "function":
+                func_info = tool["function"]
+                tools_info.append({
+                    "name": func_info["name"],
+                    "description": func_info["description"],
+                    "parameters": func_info["parameters"]
+                })
+        
+        return {
+            "total_tools": len(tools_info),
+            "tools": tools_info
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list tools: {str(e)}")
+
+@app.post("/tools/test")
+async def test_tool(tool_request: dict):
+    """
+    Test a specific tool function
+    """
+    try:
+        tool_name = tool_request.get("tool_name")
+        arguments = tool_request.get("arguments", {})
+        
+        if not tool_name:
+            raise HTTPException(status_code=400, detail="tool_name is required")
+        
+        result = execute_tool(tool_name, arguments)
+        
+        return {
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "result": result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to test tool: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

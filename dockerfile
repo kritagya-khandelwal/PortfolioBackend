@@ -23,6 +23,7 @@ RUN pip install uv
 COPY pyproject.toml ./
 COPY main.py ./
 COPY README.md ./
+COPY data/ ./data/
 
 # Install Python dependencies using uv
 RUN uv lock && uv sync
